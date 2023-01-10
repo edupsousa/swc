@@ -1,13 +1,15 @@
+use core::time;
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{mpsc, Arc},
 };
 
 use anyhow::Context;
 use clap::Parser;
 use glob::glob;
+use notify::{recommended_watcher, Watcher};
 use path_absolutize::Absolutize;
 use rayon::prelude::*;
 use relative_path::RelativePath;
@@ -115,50 +117,6 @@ static COMPILER: Lazy<Arc<Compiler>> = Lazy::new(|| {
 
 /// List of file extensions supported by default.
 static DEFAULT_EXTENSIONS: &[&str] = &["js", "jsx", "es6", "es", "mjs", "ts", "tsx"];
-
-/// Infer list of files to be transformed from cli arguments.
-/// If given input is a directory, it'll traverse it and collect all supported
-/// files.
-#[tracing::instrument(level = "info", skip_all)]
-fn get_files_list(
-    raw_files_input: &[PathBuf],
-    extensions: &[String],
-    ignore_pattern: Option<&str>,
-    _include_dotfiles: bool,
-) -> anyhow::Result<Vec<PathBuf>> {
-    let input_dir = raw_files_input.iter().find(|p| p.is_dir());
-
-    let files = if let Some(input_dir) = input_dir {
-        if raw_files_input.len() > 1 {
-            return Err(anyhow::anyhow!(
-                "Cannot specify multiple files when using a directory as input"
-            ));
-        }
-        WalkDir::new(input_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .map(|e| e.into_path())
-            .filter(|e| {
-                extensions
-                    .iter()
-                    .any(|ext| e.extension().map(|v| v == &**ext).unwrap_or(false))
-            })
-            .collect()
-    } else {
-        raw_files_input.to_owned()
-    };
-
-    if let Some(ignore_pattern) = ignore_pattern {
-        let pattern: Vec<PathBuf> = glob(ignore_pattern)?.filter_map(|p| p.ok()).collect();
-
-        return Ok(files
-            .into_iter()
-            .filter(|file_path| !pattern.iter().any(|p| p.eq(file_path)))
-            .collect());
-    }
-
-    Ok(files)
-}
 
 /// Calculate full, absolute path to the file to emit.
 /// Currently this is quite naive calculation based on assumption input file's
@@ -293,79 +251,7 @@ impl CompileOptions {
         Ok(options)
     }
 
-    /// Create canonical list of inputs to be processed across stdin / single
-    /// file / multiple files.
-    fn collect_inputs(&self) -> anyhow::Result<Vec<InputContext>> {
-        let compiler = COMPILER.clone();
-
-        let stdin_input = collect_stdin_input();
-        if stdin_input.is_some() && !self.files.is_empty() {
-            anyhow::bail!("Cannot specify inputs from stdin and files at the same time");
-        }
-
-        if let Some(stdin_input) = stdin_input {
-            let options = self.build_transform_options(&self.filename.as_deref())?;
-
-            let fm = compiler.cm.new_source_file(
-                if options.filename.is_empty() {
-                    FileName::Anon
-                } else {
-                    FileName::Real(options.filename.clone().into())
-                },
-                stdin_input,
-            );
-
-            return Ok(vec![InputContext {
-                options,
-                fm,
-                compiler,
-                file_path: self
-                    .filename
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("unknown")),
-                file_extension: self.out_file_extension.clone().into(),
-            }]);
-        } else if !self.files.is_empty() {
-            let included_extensions = if let Some(extensions) = &self.extensions {
-                extensions.clone()
-            } else {
-                DEFAULT_EXTENSIONS.iter().map(|v| v.to_string()).collect()
-            };
-
-            return get_files_list(
-                &self.files,
-                &included_extensions,
-                self.ignore.as_deref(),
-                false,
-            )?
-            .iter()
-            .map(|file_path| {
-                self.build_transform_options(&Some(file_path))
-                    .and_then(|options| {
-                        let fm = compiler
-                            .cm
-                            .load_file(file_path)
-                            .context(format!("Failed to open file {}", file_path.display()));
-                        fm.map(|fm| InputContext {
-                            options,
-                            fm,
-                            compiler: compiler.clone(),
-                            file_path: file_path.to_path_buf(),
-                            file_extension: self.out_file_extension.clone().into(),
-                        })
-                    })
-            })
-            .collect::<anyhow::Result<Vec<InputContext>>>();
-        }
-
-        anyhow::bail!("Input is empty");
-    }
-
-    fn execute_inner(&self) -> anyhow::Result<()> {
-        let mut inputs_ctrl = InputController::new();
-        let inputs = inputs_ctrl.collect_inputs(&self)?;
-        println!("{:?}", inputs_ctrl);
-
+    fn compile(&self, inputs: Vec<InputContext>) -> anyhow::Result<()> {
         let execute = |compiler: Arc<Compiler>, fm: Arc<SourceFile>, options: Options| {
             try_with_handler(
                 compiler.cm.clone(),
@@ -457,6 +343,32 @@ impl CompileOptions {
             )
         }
     }
+
+    fn execute_inner(&self) -> anyhow::Result<()> {
+        let mut inputs_ctrl = InputController::new();
+        inputs_ctrl.collect_inputs(&self)?;
+        self.compile(inputs_ctrl.inputs)?;
+
+        if self.watch {
+            let (tx, rx) = mpsc::channel();
+            let mut watcher = recommended_watcher(tx)?;
+            for item in inputs_ctrl.watch_list {
+                match item {
+                    WatchedInput::Dir(dir) => {
+                        watcher.watch(dir.as_path(), notify::RecursiveMode::Recursive)?
+                    }
+                    WatchedInput::File(file) => {
+                        watcher.watch(file.as_path(), notify::RecursiveMode::NonRecursive)?
+                    }
+                }
+            }
+            for event in rx {
+                println!("Event: {:?}", event);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[swc_trace]
@@ -479,26 +391,28 @@ impl super::CommandRunner for CompileOptions {
     }
 }
 
-#[derive(Debug)]
 enum WatchedInput {
     Dir(PathBuf),
     File(PathBuf),
 }
 
-#[derive(Debug)]
 struct InputController {
     watch_list: Vec<WatchedInput>,
+    inputs: Vec<InputContext>,
 }
 
+#[swc_trace]
 impl InputController {
     fn new() -> InputController {
-        InputController { watch_list: vec![] }
+        InputController {
+            watch_list: vec![],
+            inputs: vec![],
+        }
     }
 
-    fn collect_inputs(
-        &mut self,
-        compile_options: &CompileOptions,
-    ) -> anyhow::Result<Vec<InputContext>> {
+    /// Create canonical list of inputs to be processed across stdin / single
+    /// file / multiple files.
+    fn collect_inputs(&mut self, compile_options: &CompileOptions) -> anyhow::Result<()> {
         let compiler = COMPILER.clone();
 
         let stdin_input = collect_stdin_input();
@@ -519,7 +433,7 @@ impl InputController {
                 stdin_input,
             );
 
-            return Ok(vec![InputContext {
+            self.inputs.push(InputContext {
                 options,
                 fm,
                 compiler,
@@ -528,7 +442,8 @@ impl InputController {
                     .clone()
                     .unwrap_or_else(|| PathBuf::from("unknown")),
                 file_extension: compile_options.out_file_extension.clone().into(),
-            }]);
+            });
+            return Ok(());
         } else if !compile_options.files.is_empty() {
             let included_extensions = if let Some(extensions) = &compile_options.extensions {
                 extensions.clone()
@@ -536,7 +451,7 @@ impl InputController {
                 DEFAULT_EXTENSIONS.iter().map(|v| v.to_string()).collect()
             };
 
-            return self
+            let inputs = self
                 .get_files_list(
                     compile_options,
                     &included_extensions,
@@ -561,7 +476,9 @@ impl InputController {
                             })
                         })
                 })
-                .collect::<anyhow::Result<Vec<InputContext>>>();
+                .collect::<anyhow::Result<Vec<InputContext>>>()?;
+            self.inputs.extend(inputs);
+            return Ok(());
         }
 
         anyhow::bail!("Input is empty");
