@@ -134,7 +134,6 @@ fn get_files_list(
                 "Cannot specify multiple files when using a directory as input"
             ));
         }
-
         WalkDir::new(input_dir)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -363,7 +362,9 @@ impl CompileOptions {
     }
 
     fn execute_inner(&self) -> anyhow::Result<()> {
-        let inputs = self.collect_inputs()?;
+        let mut inputs_ctrl = InputController::new();
+        let inputs = inputs_ctrl.collect_inputs(&self)?;
+        println!("{:?}", inputs_ctrl);
 
         let execute = |compiler: Arc<Compiler>, fm: Arc<SourceFile>, options: Options| {
             try_with_handler(
@@ -475,5 +476,147 @@ impl super::CommandRunner for CompileOptions {
         }
 
         ret
+    }
+}
+
+#[derive(Debug)]
+enum WatchedInput {
+    Dir(PathBuf),
+    File(PathBuf),
+}
+
+#[derive(Debug)]
+struct InputController {
+    watch_list: Vec<WatchedInput>,
+}
+
+impl InputController {
+    fn new() -> InputController {
+        InputController { watch_list: vec![] }
+    }
+
+    fn collect_inputs(
+        &mut self,
+        compile_options: &CompileOptions,
+    ) -> anyhow::Result<Vec<InputContext>> {
+        let compiler = COMPILER.clone();
+
+        let stdin_input = collect_stdin_input();
+        if stdin_input.is_some() && !compile_options.files.is_empty() {
+            anyhow::bail!("Cannot specify inputs from stdin and files at the same time");
+        }
+
+        if let Some(stdin_input) = stdin_input {
+            let options =
+                compile_options.build_transform_options(&compile_options.filename.as_deref())?;
+
+            let fm = compiler.cm.new_source_file(
+                if options.filename.is_empty() {
+                    FileName::Anon
+                } else {
+                    FileName::Real(options.filename.clone().into())
+                },
+                stdin_input,
+            );
+
+            return Ok(vec![InputContext {
+                options,
+                fm,
+                compiler,
+                file_path: compile_options
+                    .filename
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("unknown")),
+                file_extension: compile_options.out_file_extension.clone().into(),
+            }]);
+        } else if !compile_options.files.is_empty() {
+            let included_extensions = if let Some(extensions) = &compile_options.extensions {
+                extensions.clone()
+            } else {
+                DEFAULT_EXTENSIONS.iter().map(|v| v.to_string()).collect()
+            };
+
+            return self
+                .get_files_list(
+                    compile_options,
+                    &included_extensions,
+                    compile_options.ignore.as_deref(),
+                    false,
+                )?
+                .iter()
+                .map(|file_path| {
+                    compile_options
+                        .build_transform_options(&Some(file_path))
+                        .and_then(|options| {
+                            let fm = compiler
+                                .cm
+                                .load_file(file_path)
+                                .context(format!("Failed to open file {}", file_path.display()));
+                            fm.map(|fm| InputContext {
+                                options,
+                                fm,
+                                compiler: compiler.clone(),
+                                file_path: file_path.to_path_buf(),
+                                file_extension: compile_options.out_file_extension.clone().into(),
+                            })
+                        })
+                })
+                .collect::<anyhow::Result<Vec<InputContext>>>();
+        }
+
+        anyhow::bail!("Input is empty");
+    }
+
+    fn get_files_list(
+        &mut self,
+        compile_options: &CompileOptions,
+        extensions: &[String],
+        ignore_pattern: Option<&str>,
+        _include_dotfiles: bool,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let raw_files_input = &compile_options.files;
+        let input_dir = raw_files_input.iter().find(|p| p.is_dir());
+
+        let files = if let Some(input_dir) = input_dir {
+            if raw_files_input.len() > 1 {
+                return Err(anyhow::anyhow!(
+                    "Cannot specify multiple files when using a directory as input"
+                ));
+            }
+            WalkDir::new(input_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .map(|e| e.into_path())
+                .filter(|e| {
+                    extensions
+                        .iter()
+                        .any(|ext| e.extension().map(|v| v == &**ext).unwrap_or(false))
+                })
+                .collect()
+        } else {
+            raw_files_input.to_owned()
+        };
+
+        let files = if let Some(ignore_pattern) = ignore_pattern {
+            let pattern: Vec<PathBuf> = glob(ignore_pattern)?.filter_map(|p| p.ok()).collect();
+
+            return Ok(files
+                .into_iter()
+                .filter(|file_path| !pattern.iter().any(|p| p.eq(file_path)))
+                .collect());
+        } else {
+            files
+        };
+
+        if compile_options.watch {
+            match input_dir {
+                Some(input_dir) => self.watch_list.push(WatchedInput::Dir(input_dir.clone())),
+                None => self
+                    .watch_list
+                    .extend(files.iter().map(|p| WatchedInput::File(p.clone()))),
+            }
+        }
+
+        Ok(files)
     }
 }
