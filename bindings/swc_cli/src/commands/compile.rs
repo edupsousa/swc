@@ -126,7 +126,7 @@ fn get_files_list(
     ignore_pattern: Option<&str>,
     _include_dotfiles: bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
-    let input_dir = raw_files_input.iter().find(|p| p.is_dir());
+    let input_dir = get_input_dir(raw_files_input);
 
     let files = if let Some(input_dir) = input_dir {
         if raw_files_input.len() > 1 {
@@ -150,15 +150,23 @@ fn get_files_list(
     };
 
     if let Some(ignore_pattern) = ignore_pattern {
-        let pattern: Vec<PathBuf> = glob(ignore_pattern)?.filter_map(|p| p.ok()).collect();
-
-        return Ok(files
-            .into_iter()
-            .filter(|file_path| !pattern.iter().any(|p| p.eq(file_path)))
-            .collect());
+        return filter_ignored_files(files, ignore_pattern);
     }
 
     Ok(files)
+}
+
+fn filter_ignored_files(files: Vec<PathBuf>, ignore_pattern: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let pattern: Vec<PathBuf> = glob(ignore_pattern)?.filter_map(|p| p.ok()).collect();
+
+    Ok(files
+        .into_iter()
+        .filter(|file_path| !pattern.iter().any(|p| p.eq(file_path)))
+        .collect())
+}
+
+fn get_input_dir(raw_files_input: &[PathBuf]) -> Option<&PathBuf> {
+    raw_files_input.iter().find(|p| p.is_dir())
 }
 
 /// Calculate full, absolute path to the file to emit.
@@ -296,7 +304,7 @@ impl CompileOptions {
 
     /// Create canonical list of inputs to be processed across stdin / single
     /// file / multiple files.
-    fn collect_inputs(&self) -> anyhow::Result<Vec<InputContext>> {
+    fn collect_inputs(&self) -> anyhow::Result<CompileInputs> {
         let compiler = COMPILER.clone();
 
         let stdin_input = collect_stdin_input();
@@ -316,16 +324,19 @@ impl CompileOptions {
                 stdin_input,
             );
 
-            return Ok(vec![InputContext {
-                options,
-                fm,
-                compiler,
-                file_path: self
-                    .filename
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("unknown")),
-                file_extension: self.out_file_extension.clone().into(),
-            }]);
+            return Ok(CompileInputs {
+                watch_list: vec![],
+                inputs: vec![InputContext {
+                    options,
+                    fm,
+                    compiler,
+                    file_path: self
+                        .filename
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("unknown")),
+                    file_extension: self.out_file_extension.clone().into(),
+                }],
+            });
         } else if !self.files.is_empty() {
             let included_extensions = if let Some(extensions) = &self.extensions {
                 extensions.clone()
@@ -333,7 +344,7 @@ impl CompileOptions {
                 DEFAULT_EXTENSIONS.iter().map(|v| v.to_string()).collect()
             };
 
-            return get_files_list(
+            let inputs = get_files_list(
                 &self.files,
                 &included_extensions,
                 self.ignore.as_deref(),
@@ -356,15 +367,24 @@ impl CompileOptions {
                         })
                     })
             })
-            .collect::<anyhow::Result<Vec<InputContext>>>();
+            .collect::<anyhow::Result<Vec<InputContext>>>()?;
+            let watch_list = if !self.watch {
+                vec![]
+            } else if let Some(input_dir) = get_input_dir(&self.files) {
+                vec![input_dir.to_owned()]
+            } else {
+                inputs
+                    .iter()
+                    .map(|input| input.file_path.to_owned())
+                    .collect()
+            };
+            return Ok(CompileInputs { inputs, watch_list });
         }
 
         anyhow::bail!("Input is empty");
     }
 
-    fn execute_inner(&self) -> anyhow::Result<()> {
-        let inputs = self.collect_inputs()?;
-
+    fn compile(&self, inputs: Vec<InputContext>) -> anyhow::Result<()> {
         let execute = |compiler: Arc<Compiler>, fm: Arc<SourceFile>, options: Options| {
             try_with_handler(
                 compiler.cm.clone(),
@@ -456,6 +476,20 @@ impl CompileOptions {
             )
         }
     }
+
+    fn execute_inner(&self) -> anyhow::Result<()> {
+        let input = self.collect_inputs()?;
+        self.compile(input.inputs)?;
+        if input.watch_list.len() > 0 {
+            println!("Watch List: {:?}", input.watch_list);
+        }
+        Ok(())
+    }
+}
+
+struct CompileInputs {
+    watch_list: Vec<PathBuf>,
+    inputs: Vec<InputContext>,
 }
 
 #[swc_trace]
