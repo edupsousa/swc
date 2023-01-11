@@ -2,12 +2,16 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{mpsc, Arc},
+    thread,
+    time::Duration,
 };
 
 use anyhow::Context;
 use clap::Parser;
 use glob::glob;
+use notify::RecursiveMode;
+use notify_debouncer_mini::new_debouncer;
 use path_absolutize::Absolutize;
 use rayon::prelude::*;
 use relative_path::RelativePath;
@@ -481,7 +485,23 @@ impl CompileOptions {
         let input = self.collect_inputs()?;
         self.compile(input.inputs)?;
         if input.watch_list.len() > 0 {
-            println!("Watch List: {:?}", input.watch_list);
+            let (tx, rx) = mpsc::channel();
+            let mut debouncer = new_debouncer(Duration::from_millis(300), None, tx)?;
+            let watcher = debouncer.watcher();
+            for path in input.watch_list {
+                let recursive_mode = if path.is_dir() {
+                    RecursiveMode::Recursive
+                } else {
+                    RecursiveMode::NonRecursive
+                };
+                watcher.watch(path.as_path(), recursive_mode)?;
+            }
+            for events in rx {
+                for e in events {
+                    println!("Event: {:?}", e);
+                }
+                self.compile(input.inputs)?;
+            }
         }
         Ok(())
     }
