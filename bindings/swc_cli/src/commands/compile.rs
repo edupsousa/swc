@@ -2,16 +2,12 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
-    thread,
-    time::Duration,
+    sync::Arc,
 };
 
 use anyhow::Context;
 use clap::Parser;
 use glob::glob;
-use notify::RecursiveMode;
-use notify_debouncer_mini::new_debouncer;
 use path_absolutize::Absolutize;
 use rayon::prelude::*;
 use relative_path::RelativePath;
@@ -306,31 +302,33 @@ impl CompileOptions {
         Ok(options)
     }
 
+    fn get_included_extensions(&self) -> Vec<String> {
+        if let Some(extensions) = &self.extensions {
+            extensions.clone()
+        } else {
+            DEFAULT_EXTENSIONS.iter().map(|v| v.to_string()).collect()
+        }
+    }
+
     /// Create canonical list of inputs to be processed across stdin / single
     /// file / multiple files.
-    fn collect_inputs(&self) -> anyhow::Result<CompileInputs> {
+    fn collect_inputs(&self, input: &InputType) -> anyhow::Result<Vec<InputContext>> {
         let compiler = COMPILER.clone();
 
-        let stdin_input = collect_stdin_input();
-        if stdin_input.is_some() && !self.files.is_empty() {
-            anyhow::bail!("Cannot specify inputs from stdin and files at the same time");
-        }
+        match input {
+            InputType::Stdin(input) => {
+                let options = self.build_transform_options(&self.filename.as_deref())?;
 
-        if let Some(stdin_input) = stdin_input {
-            let options = self.build_transform_options(&self.filename.as_deref())?;
+                let fm = compiler.cm.new_source_file(
+                    if options.filename.is_empty() {
+                        FileName::Anon
+                    } else {
+                        FileName::Real(options.filename.clone().into())
+                    },
+                    input.to_string(),
+                );
 
-            let fm = compiler.cm.new_source_file(
-                if options.filename.is_empty() {
-                    FileName::Anon
-                } else {
-                    FileName::Real(options.filename.clone().into())
-                },
-                stdin_input,
-            );
-
-            return Ok(CompileInputs {
-                watch_list: vec![],
-                inputs: vec![InputContext {
+                return Ok(vec![InputContext {
                     options,
                     fm,
                     compiler,
@@ -339,50 +337,84 @@ impl CompileOptions {
                         .clone()
                         .unwrap_or_else(|| PathBuf::from("unknown")),
                     file_extension: self.out_file_extension.clone().into(),
-                }],
-            });
-        } else if !self.files.is_empty() {
-            let included_extensions = if let Some(extensions) = &self.extensions {
-                extensions.clone()
-            } else {
-                DEFAULT_EXTENSIONS.iter().map(|v| v.to_string()).collect()
-            };
+                }]);
+            }
+            InputType::Files(files) => {
+                let included_extensions = self.get_included_extensions();
 
-            let inputs = get_files_list(
-                &self.files,
-                &included_extensions,
-                self.ignore.as_deref(),
-                false,
-            )?
-            .iter()
-            .map(|file_path| {
-                self.build_transform_options(&Some(file_path))
-                    .and_then(|options| {
-                        let fm = compiler
-                            .cm
-                            .load_file(file_path)
-                            .context(format!("Failed to open file {}", file_path.display()));
-                        fm.map(|fm| InputContext {
-                            options,
-                            fm,
-                            compiler: compiler.clone(),
-                            file_path: file_path.to_path_buf(),
-                            file_extension: self.out_file_extension.clone().into(),
+                return get_files_list(
+                    &files,
+                    &included_extensions,
+                    self.ignore.as_deref(),
+                    false,
+                )?
+                .iter()
+                .map(|file_path| {
+                    self.build_transform_options(&Some(file_path))
+                        .and_then(|options| {
+                            let fm = compiler
+                                .cm
+                                .load_file(file_path)
+                                .context(format!("Failed to open file {}", file_path.display()));
+                            fm.map(|fm| InputContext {
+                                options,
+                                fm,
+                                compiler: compiler.clone(),
+                                file_path: file_path.to_path_buf(),
+                                file_extension: self.out_file_extension.clone().into(),
+                            })
                         })
-                    })
-            })
-            .collect::<anyhow::Result<Vec<InputContext>>>()?;
-            let watch_list = if !self.watch {
-                vec![]
-            } else if let Some(input_dir) = get_input_dir(&self.files) {
-                vec![input_dir.to_owned()]
+                })
+                .collect::<anyhow::Result<Vec<InputContext>>>();
+            }
+            InputType::Dir(input_dir) => {
+                let included_extensions = self.get_included_extensions();
+
+                return get_files_list(
+                    &vec![input_dir.to_owned()],
+                    &included_extensions,
+                    self.ignore.as_deref(),
+                    false,
+                )?
+                .iter()
+                .map(|file_path| {
+                    self.build_transform_options(&Some(file_path))
+                        .and_then(|options| {
+                            let fm = compiler
+                                .cm
+                                .load_file(file_path)
+                                .context(format!("Failed to open file {}", file_path.display()));
+                            fm.map(|fm| InputContext {
+                                options,
+                                fm,
+                                compiler: compiler.clone(),
+                                file_path: file_path.to_path_buf(),
+                                file_extension: self.out_file_extension.clone().into(),
+                            })
+                        })
+                })
+                .collect::<anyhow::Result<Vec<InputContext>>>();
+            }
+        }
+    }
+
+    fn get_input(&self) -> anyhow::Result<InputType> {
+        let stdin_input = collect_stdin_input();
+        if stdin_input.is_some() && !self.files.is_empty() {
+            anyhow::bail!("Cannot specify inputs from stdin and files at the same time");
+        }
+
+        if let Some(stdin_input) = stdin_input {
+            return Ok(InputType::Stdin(stdin_input));
+        } else if !self.files.is_empty() {
+            if let Some(input_dir) = get_input_dir(&self.files) {
+                if self.files.len() > 1 {
+                    anyhow::bail!("Cannot specify multiple files when using a directory as input");
+                }
+                return Ok(InputType::Dir(input_dir.to_owned()));
             } else {
-                inputs
-                    .iter()
-                    .map(|input| input.file_path.to_owned())
-                    .collect()
-            };
-            return Ok(CompileInputs { inputs, watch_list });
+                return Ok(InputType::Files(self.files.to_owned()));
+            }
         }
 
         anyhow::bail!("Input is empty");
@@ -482,34 +514,41 @@ impl CompileOptions {
     }
 
     fn execute_inner(&self) -> anyhow::Result<()> {
-        let input = self.collect_inputs()?;
-        self.compile(input.inputs)?;
-        if input.watch_list.len() > 0 {
-            let (tx, rx) = mpsc::channel();
-            let mut debouncer = new_debouncer(Duration::from_millis(300), None, tx)?;
-            let watcher = debouncer.watcher();
-            for path in input.watch_list {
-                let recursive_mode = if path.is_dir() {
-                    RecursiveMode::Recursive
-                } else {
-                    RecursiveMode::NonRecursive
-                };
-                watcher.watch(path.as_path(), recursive_mode)?;
-            }
-            for events in rx {
-                for e in events {
-                    println!("Event: {:?}", e);
-                }
-                self.compile(input.inputs)?;
-            }
-        }
+        let input = self.get_input()?;
+        let inputs = self.collect_inputs(&input)?;
+        self.compile(inputs)?;
+        // if self.watch {
+        //     let watch_list = match input.input {
+        //         InputType::Dir(path) => vec![path],
+        //         InputType::Files(paths) => paths,
+        //         InputType::Stdin(_) => vec![],
+        //     };
+        //     let (tx, rx) = mpsc::channel();
+        //     let mut debouncer = new_debouncer(Duration::from_millis(300), None, tx)?;
+        //     let watcher = debouncer.watcher();
+        //     for path in watch_list {
+        //         let recursive_mode = if path.is_dir() {
+        //             RecursiveMode::Recursive
+        //         } else {
+        //             RecursiveMode::NonRecursive
+        //         };
+        //         watcher.watch(path.as_path(), recursive_mode)?;
+        //     }
+        //     for events in rx {
+        //         for e in events {
+        //             println!("Event: {:?}", e);
+        //         }
+        //         self.compile(input.inputs)?;
+        //     }
+        // }
         Ok(())
     }
 }
 
-struct CompileInputs {
-    watch_list: Vec<PathBuf>,
-    inputs: Vec<InputContext>,
+enum InputType {
+    Stdin(String),
+    Dir(PathBuf),
+    Files(Vec<PathBuf>),
 }
 
 #[swc_trace]
